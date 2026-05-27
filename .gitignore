@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+RiFT/Wang 等 - 2025 - New paradigm of adversarial training Releasing accuracy-robustness trade-off via dummy class.pdf
+RiFT/Zhu 等 - 2023 - Improving generalization of adversarial training via robust critical fine-tuning.pdf
+RiFT/weights/cifar_linf_8.pt
+RiFT/weights/ResNet18_CIFAR10.pth
+RiFT/weights/ResNet18_CIFAR100.pth
+RiFT/weights/ResNet18_Tiny.pth

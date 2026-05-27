@@ -13,6 +13,19 @@ from optimizer import *
 from robustbench.utils import load_model
 
 
+def predict_with_dummy_mapper(logits):
+    """Map dummy-class predictions back to original classes using logits over real classes."""
+    if logits.size(1) <= 1:
+        return logits.argmax(dim=1)
+    dummy_idx = logits.size(1) - 1
+    pred = logits.argmax(dim=1)
+    dummy_mask = pred.eq(dummy_idx)
+    if dummy_mask.any():
+        real_logits = logits[dummy_mask, :dummy_idx]
+        pred[dummy_mask] = real_logits.argmax(dim=1)
+    return pred
+
+
 def generate_adv_dataset(args, model):
     adv_train_dataset = adv_dataset()
 
