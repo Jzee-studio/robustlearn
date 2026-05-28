@@ -13,8 +13,26 @@ from optimizer import *
 from robustbench.utils import load_model
 
 
-def predict_with_dummy_mapper(logits):
-    """Map dummy-class predictions back to original classes using logits over real classes."""
+class BufferClassWrapper(nn.Module):
+    """Append a simple buffer logit to the original classifier output.
+
+    Scheme B: keep the mapper simple. If the buffer class is predicted at
+    inference time, map it back to the most confident real class.
+    """
+
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        self.dummy_bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        real_logits = self.base_model(x)
+        dummy_logit = self.dummy_bias.expand(real_logits.size(0), 1)
+        return torch.cat([real_logits, dummy_logit], dim=1)
+
+
+def predict_with_buffer_mapper(logits):
+    """Map buffer-class predictions back to original classes using logits over real classes."""
     if logits.size(1) <= 1:
         return logits.argmax(dim=1)
     dummy_idx = logits.size(1) - 1
@@ -185,6 +203,41 @@ def train(args, model, dataloader, optimizer, criterion):
     return train_loss / total, correct / total * 100
 
 
+def train_with_dummy(args, model, dataloader, optimizer, criterion, difficulty_threshold):
+    model.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    dummy_total = 0
+
+    for i, (inputs, targets) in enumerate(tqdm(dataloader)):
+        inputs, targets = inputs.to(args.device), targets.to(args.device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        base_logits = outputs[:, :-1]
+        base_loss = criterion(base_logits, targets)
+        per_sample_loss = F.cross_entropy(base_logits, targets, reduction='none')
+        hard_mask = per_sample_loss >= difficulty_threshold
+
+        if hard_mask.any():
+            hard_targets = torch.full_like(targets[hard_mask], args.num_classes)
+            hard_loss = criterion(outputs[hard_mask], hard_targets)
+            loss = base_loss + args.dummy_lambda * hard_loss
+            dummy_total += hard_mask.sum().item()
+        else:
+            loss = base_loss
+
+        train_loss += loss.item() * targets.size(0)
+        loss.backward()
+        optimizer.step()
+
+        pred = predict_with_buffer_mapper(outputs)
+        total += targets.size(0)
+        correct += pred.eq(targets).sum().item()
+
+    return train_loss / total, correct / total * 100, dummy_total / total * 100
+
+
 def main():
 
     parser = argparse.ArgumentParser(description='PyTorch Training')
@@ -194,6 +247,9 @@ def main():
     parser.add_argument('--input_size', default=32, type=int, help='input_size')
     parser.add_argument('--layer', default=None, type=str, help='Trainable layer')
     parser.add_argument("--cal_mrc", action="store_true", help='If to calculate Module Robust Criticality (MRC) value of each module.')
+    parser.add_argument("--use_dummy", action="store_true", help='Use dummy-class fine-tuning for hard clean samples')
+    parser.add_argument("--dummy_lambda", default=1.0, type=float, help='weight for dummy-class loss')
+    parser.add_argument("--dummy_quantile", default=0.7, type=float, help='quantile to define hard samples from clean loss')
     
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--resume', default=None, type=str, help='resume from checkpoint')
@@ -273,6 +329,20 @@ def main():
     model = create_model(args.model, args.input_size, args.num_classes, args.device, args.patch, args.resume)
     logger.info(args.model)
 
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+        if args.layer is not None and args.layer in name:
+            param.requires_grad = True
+
+    if args.use_dummy:
+        model = BufferClassWrapper(model).to(args.device)
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            if name.endswith("dummy_bias"):
+                param.requires_grad = True
+            if args.layer is not None and f"base_model.{args.layer}" in name:
+                param.requires_grad = True
+
     logger.info('==> Building optimizer and learning rate scheduler...')
     optimizer = create_optimizer(args.optim, model, args.lr, args.momentum, weight_decay=args.wd)
     logger.info(optimizer)
@@ -295,34 +365,46 @@ def main():
         layer_sharpness(args, deepcopy(model), epsilon=0.1)
         exit()
 
-    assert args.layer is not None
+    assert args.layer is not None or args.use_dummy
 
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if args.layer in name:
-            param.requires_grad = True
-
-    _, train_acc = evaluate(args, model, trainloader, criterion)
-    _, test_acc = evaluate(args, model, testloader, criterion)
-    test_robust_acc = evalulate_robustness(args, model)
+    _, train_acc = evaluate(args, model.base_model if args.use_dummy else model, trainloader, criterion)
+    _, test_acc = evaluate(args, model.base_model if args.use_dummy else model, testloader, criterion)
+    test_robust_acc = evalulate_robustness(args, model.base_model if args.use_dummy else model)
     logger.info("==> Init train acc: {:.2f}%, test acc: {:.2f}%, robust acc: {:.2f}%".format(train_acc, test_acc, test_robust_acc))
 
+    if args.use_dummy:
+        clean_losses = []
+        with torch.no_grad():
+            for inputs, targets in trainloader:
+                inputs, targets = inputs.to(args.device), targets.to(args.device)
+                logits = model.base_model(inputs)
+                batch_losses = F.cross_entropy(logits, targets, reduction='none')
+                clean_losses.append(batch_losses)
+        all_losses = torch.cat(clean_losses)
+        difficulty_threshold = torch.quantile(all_losses, args.dummy_quantile).item()
+        logger.info("==> Dummy threshold (quantile {:.2f}): {:.4f}".format(args.dummy_quantile, difficulty_threshold))
+    else:
+        difficulty_threshold = None
 
     for epoch in range(start_epoch, start_epoch + args.epochs):
 
         logger.info("==> Epoch {}".format(epoch))
         logger.info("==> Training...")
-        train_loss, train_acc = train(args, model, trainloader, optimizer, criterion)
-
-        logger.info("==> Train loss: {:.2f}, train acc: {:.2f}%".format(train_loss, train_acc))
+        if args.use_dummy:
+            train_loss, train_acc, buffer_ratio = train_with_dummy(args, model, trainloader, optimizer, criterion, difficulty_threshold)
+            logger.info("==> Train loss: {:.2f}, train acc: {:.2f}%, buffer ratio: {:.2f}%".format(train_loss, train_acc, buffer_ratio))
+        else:
+            train_loss, train_acc = train(args, model, trainloader, optimizer, criterion)
+            logger.info("==> Train loss: {:.2f}, train acc: {:.2f}%".format(train_loss, train_acc))
 
         logger.info("==> Testing...")
-        test_loss, test_acc = evaluate(args, model, testloader, criterion)
+        eval_model = model.base_model if args.use_dummy else model
+        test_loss, test_acc = evaluate(args, eval_model, testloader, criterion)
 
         logger.info("==> Test loss: {:.2f}, test acc: {:.2f}%".format(test_loss, test_acc))
 
         state = {
-            'model': model.state_dict(),
+            'model': eval_model.state_dict(),
             'acc': test_acc,
             'epoch': epoch,
         }
@@ -340,15 +422,20 @@ def main():
         scheduler.step()
 
     checkpoint = torch.load(model_save_dir + "best_params.pth")
-    model.load_state_dict(checkpoint["model"])
+    if args.use_dummy:
+        model.base_model.load_state_dict(checkpoint["model"])
+        eval_model = model.base_model
+    else:
+        model.load_state_dict(checkpoint["model"])
+        eval_model = model
 
-    test_loss, test_acc = evaluate(args, model, testloader, criterion)
+    test_loss, test_acc = evaluate(args, eval_model, testloader, criterion)
     
-    test_robust_acc = evalulate_robustness(args, model)
+    test_robust_acc = evalulate_robustness(args, eval_model)
 
     logger.info("==> Finetune test acc: {:.2f}%, robust acc: {:.2f}".format(test_acc, test_robust_acc))
 
-    logger.info(interpolation(args, logger, init_sd, deepcopy(model.state_dict()), model, testloader, criterion, model_save_dir, evalulate_robustness))
+    logger.info(interpolation(args, logger, init_sd, deepcopy(eval_model.state_dict()), eval_model, testloader, criterion, model_save_dir, evalulate_robustness))
 
 
 if __name__ == "__main__":

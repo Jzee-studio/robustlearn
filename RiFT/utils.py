@@ -29,15 +29,19 @@ def interpolation(args, logger, init_sd, ft_sd, model, dataloader, criterion, sa
     # alphas = np.arange(0, 0.21, 0.01)
 
     records = []
+    shared_keys = [name for name in init_sd.keys() if name in ft_sd]
+    extra_keys = [name for name in ft_sd.keys() if name not in init_sd]
 
     for alpha in alphas:
         model_dict = {}
-        for name, _ in init_sd.items():
+        for name in shared_keys:
             model_dict[name] = alpha * ft_sd[name] + (1 - alpha) * init_sd[name]
+        for name in extra_keys:
+            model_dict[name] = ft_sd[name]
 
         torch.save(model_dict, save_dir + "finetune_{:.3f}_params.pth".format(alpha))
 
-        model.load_state_dict(model_dict)
+        model.load_state_dict(model_dict, strict=False)
         test_loss, test_acc = evaluate(args, model, dataloader, criterion)
         test_robust_acc = eval_robustness_func(args, model)
 
@@ -253,13 +257,13 @@ def evaluate(args, model, dataloader, criterion):
 class Normalize(nn.Module):
     def __init__(self, mean, std) :
         super(Normalize, self).__init__()
-        self.register_buffer('mean', torch.Tensor(mean).to("cuda"))
-        self.register_buffer('std', torch.Tensor(std).to("cuda"))
+        self.register_buffer('mean', torch.Tensor(mean))
+        self.register_buffer('std', torch.Tensor(std))
         
     def forward(self, input):
         # Broadcasting
-        mean = self.mean.reshape(1, 3, 1, 1)
-        std = self.std.reshape(1, 3, 1, 1)
+        mean = self.mean.reshape(1, 3, 1, 1).to(input.device)
+        std = self.std.reshape(1, 3, 1, 1).to(input.device)
         return (input - mean) / std
 
 
@@ -319,8 +323,11 @@ def init_params(net):
                 init.constant(m.bias, 0)
 
 
-_, term_width = os.popen('stty size', 'r').read().split()
-term_width = int(term_width)
+try:
+    _, term_width = os.popen('stty size', 'r').read().split()
+    term_width = int(term_width)
+except Exception:
+    term_width = 80
 
 TOTAL_BAR_LENGTH = 65.
 last_time = time.time()
