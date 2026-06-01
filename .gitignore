@@ -133,3 +133,6 @@ RiFT/weights/cifar_linf_8.pt
 RiFT/weights/ResNet18_CIFAR10.pth
 RiFT/weights/ResNet18_CIFAR100.pth
 RiFT/weights/ResNet18_Tiny.pth
+/RiFT/demo_tinyimagenet
+/RiFT/vis_demo
+/RiFT/vis_grad
