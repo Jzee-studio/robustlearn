@@ -45,7 +45,7 @@ g.manual_seed(0)
 
 class TinyImageNet(Dataset):
     def __init__(self, dataset_type, transform=None):
-        self.root = "./data/tiny-imagenet-200/"
+        self.root = "E:/Jzee4Study/dataset/tiny-imagenet-200/"
         data_path = os.path.join(self.root, dataset_type)
 
         self.dataset = torchvision.datasets.ImageFolder(root=data_path)
@@ -65,7 +65,7 @@ class TinyImageNet(Dataset):
 
 
 class TinyImageNetC(Dataset):
-    def __init__(self, name, data_dir="./data/Tiny-ImageNet-C", level=1):
+    def __init__(self, name, data_dir="E:/Jzee4Study/dataset/Tiny-ImageNet-C", level=1):
         self.corruptions = [
             "gaussian_noise",
             "shot_noise",

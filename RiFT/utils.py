@@ -104,7 +104,7 @@ def evaluate_tiny_robustness(args, model):
         transforms.ToTensor(),
     ])
 
-    dataset = datasets.ImageFolder(root="./data/tiny-imagenet-200/val", transform=transform_test)
+    dataset = datasets.ImageFolder(root="E:/Jzee4Study/dataset/tiny-imagenet-200/val", transform=transform_test)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=8)
 
     norm_layer = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -131,7 +131,7 @@ def evaluate_tiny_robustness(args, model):
     return correct / total * 100
 
 
-def evaluate_tiny_corruption(args, model, data_dir="./data/Tiny-ImageNet-C", level=1):
+def evaluate_tiny_corruption(args, model, data_dir="E:/Jzee4Study/dataset/Tiny-ImageNet-C", level=1):
     model.eval()
 
     avg_acc = 0.0
