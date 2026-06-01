@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import logging
+import shutil
 
 import torch
 import torch.nn as nn
@@ -65,9 +66,9 @@ def evaluate_cifar_robustness(args, model):
     ])
 
     if args.dataset == "CIFAR10":
-        dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+        dataset = datasets.CIFAR10(root=os.path.join(args.data_root, 'CIFAR-10'), train=False, download=True, transform=transform_test)
     else:
-        dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+        dataset = datasets.CIFAR100(root=os.path.join(args.data_root, 'CIFAR-100'), train=False, download=True, transform=transform_test)
 
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=8)
 
@@ -100,7 +101,7 @@ def evaluate_tiny_robustness(args, model):
         transforms.ToTensor(),
     ])
 
-    dataset = datasets.ImageFolder(root="./data/tiny-imagenet-200/val", transform=transform_test)
+    dataset = datasets.ImageFolder(root=os.path.join(args.data_root, "tiny-imagenet-200", "val"), transform=transform_test)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=8)
 
     norm_layer = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -157,7 +158,7 @@ def evaluate_tiny_corruption(args, model, data_dir="./data/Tiny-ImageNet-C", lev
     for cname in corruptions:
         correct = 0
         total = 0
-        dataset = TinyImageNetC(cname, data_dir=data_dir, level=level)
+        dataset = TinyImageNetC(cname, data_root=args.data_root, level=level)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
         with torch.no_grad():
             for batch_idx, (inputs, targets) in enumerate(dataloader):
@@ -205,10 +206,9 @@ def evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-100-C"):
     corruption_acc_dict = {}
     for cname in corruptions:
         if args.dataset == "CIFAR10":
-            dataset = CIFAR10C(cname, data_dir=data_dir)
+            dataset = CIFAR10C(cname, data_root=args.data_root)
         elif args.dataset == "CIFAR100":
-            # dataset = CIFAR100C(cname, data_dir=data_dir)
-            dataset = CIFAR100C(cname)
+            dataset = CIFAR100C(cname, data_root=args.data_root)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
         
         correct = 0
@@ -319,8 +319,10 @@ def init_params(net):
                 init.constant(m.bias, 0)
 
 
-_, term_width = os.popen('stty size', 'r').read().split()
-term_width = int(term_width)
+try:
+    term_width = shutil.get_terminal_size().columns
+except OSError:
+    term_width = 80
 
 TOTAL_BAR_LENGTH = 65.
 last_time = time.time()

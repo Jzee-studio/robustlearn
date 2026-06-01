@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--patch', default=4, type=int, help='num patch (used by vit)')
 
     parser.add_argument('--device', default="cuda", type=str, help='device')
+    parser.add_argument('--data_root', default="E:/Jzee4Study/dataset", type=str, help='dataset root directory')
 
     parser.add_argument('--batch_size', default=1024, type=int, help='batch size')
 
@@ -26,10 +27,10 @@ def main():
     # create model
     model = create_model(args.model, args.input_size, args.num_classes, args.device, args.patch, args.resume)
     if args.dataset == "CIFAR10":
-        corruption_acc_dict = evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-10-C")
+        corruption_acc_dict = evaluate_cifar_corruption(args, model)
         print(corruption_acc_dict)
     elif args.dataset == "CIFAR100":
-        corruption_acc_dict = evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-100-C")
+        corruption_acc_dict = evaluate_cifar_corruption(args, model)
         print(corruption_acc_dict)
     elif args.dataset == "TinyImageNet":
         corruption_acc_dict = evaluate_tiny_corruption(args, model)
