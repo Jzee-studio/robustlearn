@@ -25,11 +25,11 @@ def generate_adv_dataset(args, model):
     ])
     
     if args.dataset == "CIFAR10":
-        train_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+        train_dataset = datasets.CIFAR10(root=os.path.join(args.data_root, 'CIFAR-10'), train=False, download=True, transform=transform_test)
     elif args.dataset == "CIFAR100":
-        train_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+        train_dataset = datasets.CIFAR100(root=os.path.join(args.data_root, 'CIFAR-100'), train=False, download=True, transform=transform_test)
     else:
-        train_dataset = TinyImageNet("train", transform_test)
+        train_dataset = TinyImageNet("train", transform_test, data_root=args.data_root)
 
     trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=8)
 
@@ -190,6 +190,7 @@ def main():
     parser.add_argument('--optim', default="SGDM", type=str, help="optimizer")
 
     parser.add_argument('--device', default="cuda", type=str, help='device')
+    parser.add_argument('--data_root', default="E:/Jzee4Study/dataset", type=str, help='dataset root directory')
     
     parser.add_argument('--lr_scheduler', default="step", choices=["step", 'cosine'])
 
@@ -250,7 +251,7 @@ def main():
 
     transform_dict = {"train": transform_train, "test": transform_test}
 
-    trainloader, _, testloader = create_dataloader(args.dataset, args.batch_size, use_val=False, transform_dict=transform_dict)
+    trainloader, _, testloader = create_dataloader(args.dataset, args.batch_size, use_val=False, transform_dict=transform_dict, data_root=args.data_root)
 
     logger.info('==> Building dataloaders...')
     logger.info(args.dataset)

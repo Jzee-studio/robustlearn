@@ -44,8 +44,8 @@ g.manual_seed(0)
 
 
 class TinyImageNet(Dataset):
-    def __init__(self, dataset_type, transform=None):
-        self.root = "./data/tiny-imagenet-200/"
+    def __init__(self, dataset_type, transform=None, data_root="E:/Jzee4Study/dataset"):
+        self.root = os.path.join(data_root, "tiny-imagenet-200")
         data_path = os.path.join(self.root, dataset_type)
 
         self.dataset = torchvision.datasets.ImageFolder(root=data_path)
@@ -65,7 +65,7 @@ class TinyImageNet(Dataset):
 
 
 class TinyImageNetC(Dataset):
-    def __init__(self, name, data_dir="./data/Tiny-ImageNet-C", level=1):
+    def __init__(self, name, data_root="E:/Jzee4Study/dataset", level=1):
         self.corruptions = [
             "gaussian_noise",
             "shot_noise",
@@ -88,7 +88,7 @@ class TinyImageNetC(Dataset):
         ]
 
         assert name in self.corruptions
-        self.root = data_dir
+        self.root = os.path.join(data_root, "Tiny-ImageNet-C")
         data_path = os.path.join(self.root, name+"/"+str(level))
 
         self.dataset = torchvision.datasets.ImageFolder(root=data_path)
@@ -115,7 +115,7 @@ class TinyImageNetC(Dataset):
 
 
 class CIFAR100C(Dataset):
-    def __init__(self, name, data_dir="./data/CIFAR-100-C"):
+    def __init__(self, name, data_root="E:/Jzee4Study/dataset"):
         self.corruptions = [
             "gaussian_noise",
             "shot_noise",
@@ -138,7 +138,7 @@ class CIFAR100C(Dataset):
         ]
 
         assert name in self.corruptions
-        self.root = data_dir
+        self.root = os.path.join(data_root, "CIFAR-100-C")
         data_path = os.path.join(self.root, name + '.npy')
         target_path = os.path.join(self.root, 'labels.npy')
 
@@ -163,7 +163,7 @@ class CIFAR100C(Dataset):
 
 
 class CIFAR10C(Dataset):
-    def __init__(self, name, data_dir="./data/CIFAR-10-C"):
+    def __init__(self, name, data_root="E:/Jzee4Study/dataset"):
         self.corruptions = [
             "gaussian_noise",
             "shot_noise",
@@ -186,7 +186,7 @@ class CIFAR10C(Dataset):
         ]
 
         assert name in self.corruptions
-        self.root = data_dir
+        self.root = os.path.join(data_root, "CIFAR-10-C")
         data_path = os.path.join(self.root, name + '.npy')
         target_path = os.path.join(self.root, 'labels.npy')
 
@@ -237,7 +237,8 @@ class adv_dataset(Dataset):
 
 
 class mini_imagenet_dataset(Dataset):
-    def __init__(self, csv_dir, transform=None):
+    def __init__(self, csv_dir, transform=None, data_root="E:/Jzee4Study/dataset"):
+        self.data_root = data_root
         img_label_pairs = pd.read_csv(csv_dir)
 
         self.imgs = img_label_pairs["filename"].values
@@ -254,7 +255,7 @@ class mini_imagenet_dataset(Dataset):
             self.idx2label[v] = k
 
     def __getitem__(self, item):
-        img = Image.open("./data/mini-imagenet/images/" + self.imgs[item][:9] + "/" + self.imgs[item]).convert("RGB")
+        img = Image.open(os.path.join(self.data_root, "mini-imagenet", "images", self.imgs[item][:9], self.imgs[item])).convert("RGB")
         label = self.label2idx[self.labels[item]]
         return self.transform(img), torch.tensor(label)
 
@@ -262,7 +263,7 @@ class mini_imagenet_dataset(Dataset):
         return len(self.imgs)
 
 
-def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, resize=None):
+def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, resize=None, data_root="E:/Jzee4Study/dataset"):
     if dataset == "TinyImageNet":
         if transform_dict is not None:
             transform_train, transform_test = transform_dict["train"], transform_dict["test"]
@@ -280,8 +281,8 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
                 transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
             ])
 
-        train_dataset = TinyImageNet("train", transform_train)
-        testset = TinyImageNet("val", transform_test)
+        train_dataset = TinyImageNet("train", transform_train, data_root=data_root)
+        testset = TinyImageNet("val", transform_test, data_root=data_root)
         trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
         valloader = None
         testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=8)        
@@ -302,14 +303,14 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
             ])
         
-        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+        train_dataset = datasets.CIFAR10(root=os.path.join(data_root, 'CIFAR-10'), train=True, download=True, transform=transform_train)
 
         if use_val:
 
-            valid_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_test)
+            valid_dataset = datasets.CIFAR10(root=os.path.join(data_root, 'CIFAR-10'), train=True, download=True, transform=transform_test)
 
-            train_idx = np.loadtxt("./data/train_idx.txt", dtype=int)
-            valid_idx = np.loadtxt("./data/val_idx.txt", dtype=int)
+            train_idx = np.loadtxt(os.path.join(data_root, "train_idx.txt"), dtype=int)
+            valid_idx = np.loadtxt(os.path.join(data_root, "val_idx.txt"), dtype=int)
 
             train_sampler = SubsetRandomSampler(train_idx)
             valid_sampler = SubsetRandomSampler(valid_idx)
@@ -327,7 +328,7 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
                 train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
             valloader = None
         testset = torchvision.datasets.CIFAR10(
-            root='./data', train=False, download=True, transform=transform_test)
+            root=os.path.join(data_root, 'CIFAR-10'), train=False, download=True, transform=transform_test)
 
         testloader = torch.utils.data.DataLoader(
             testset, batch_size=batch_size, shuffle=False, num_workers=8)
@@ -349,12 +350,12 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
             ])
         
-        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train, )
+        train_dataset = datasets.CIFAR100(root=os.path.join(data_root, 'CIFAR-100'), train=True, download=True, transform=transform_train, )
 
         # load the dataset
         if use_val:
 
-            valid_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_test, )
+            valid_dataset = datasets.CIFAR100(root=os.path.join(data_root, 'CIFAR-100'), train=True, download=True, transform=transform_test, )
 
             indices = list(range(50000))
             np.random.shuffle(indices)
@@ -376,7 +377,7 @@ def create_dataloader(dataset, batch_size, use_val=True, transform_dict=None, re
             trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
             valloader = None
 
-        testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+        testset = torchvision.datasets.CIFAR100(root=os.path.join(data_root, 'CIFAR-100'), train=False, download=True, transform=transform_test)
 
         testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=8)
 
