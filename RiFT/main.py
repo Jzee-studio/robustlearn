@@ -44,108 +44,166 @@ def generate_adv_dataset(args, model):
     return adv_train_dataset
 
 
-def layer_sharpness(args, model, epsilon=0.1):
-    
+def _build_eval_model(args, model):
     if "CIFAR" in args.dataset:
         norm_layer = Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2471, 0.2435, 0.2616])
     else:
         norm_layer = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    return nn.Sequential(norm_layer, model).to(args.device)
 
-    model = nn.Sequential(norm_layer, model).to(args.device)
-    
+
+def _normalize_layer_name(layer_name):
+    if layer_name.startswith("1.module."):
+        return layer_name[len("1.module."):]
+    if layer_name.startswith("module."):
+        return layer_name[len("module."):]
+    if layer_name.startswith("1."):
+        return layer_name[len("1."):]
+    return layer_name
+
+
+def _matching_param_name(layer_name):
+    normalized = _normalize_layer_name(layer_name)
+    return [
+        f"{normalized}.weight",
+        f"1.{normalized}.weight",
+        f"module.{normalized}.weight",
+        f"1.module.{normalized}.weight",
+    ]
+
+
+def _collect_target_layers(model):
+    layer_names = []
+    for name, module in model.named_modules():
+        normalized_name = _normalize_layer_name(name)
+        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+            if "sub" in normalized_name:
+                continue
+            if normalized_name == "" or normalized_name == "module":
+                continue
+            layer_names.append(normalized_name)
+    return sorted(set(layer_names))
+
+
+def _evaluate_mrc_group(args, model, trainloader, criterion, layer_names, epsilon=0.1):
+    cloned_model = deepcopy(model)
+    normalized_layer_names = {_normalize_layer_name(layer) for layer in layer_names}
+    for name, param in cloned_model.named_parameters():
+        param.requires_grad = False
+        if any(name == candidate for layer in normalized_layer_names for candidate in _matching_param_name(layer)):
+            param.requires_grad = True
+
+    trainable_params = [name for name, param in cloned_model.named_parameters() if param.requires_grad]
+    if not trainable_params:
+        return None
+
+    init_params = {name: param.detach().clone() for name, param in cloned_model.named_parameters() if param.requires_grad}
+    optimizer = torch.optim.SGD(cloned_model.parameters(), lr=1)
+
+    max_loss = 0.0
+    min_acc = 0.0
+
+    for _ in range(10):
+        for inputs, targets in trainloader:
+            optimizer.zero_grad()
+            outputs = cloned_model(inputs)
+            loss = -1 * criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+        state_dict = cloned_model.state_dict()
+        for layer_name in normalized_layer_names:
+            for candidate in _matching_param_name(layer_name):
+                if candidate in state_dict and candidate in init_params:
+                    diff = state_dict[candidate] - init_params[candidate]
+                    times = torch.linalg.norm(diff) / torch.linalg.norm(init_params[candidate])
+                    if times > epsilon:
+                        diff = diff / times * epsilon
+                        state_dict[candidate] = deepcopy(init_params[candidate] + diff)
+                    break
+        cloned_model.load_state_dict(state_dict)
+
+        with torch.no_grad():
+            total = 0
+            total_loss = 0.0
+            correct = 0
+            for inputs, targets in trainloader:
+                outputs = cloned_model(inputs)
+                total += targets.shape[0]
+                total_loss += criterion(outputs, targets).item() * targets.shape[0]
+                _, predicted = outputs.max(1)
+                correct += predicted.eq(targets).sum().item()
+
+            total_loss /= total
+            correct /= total
+
+        if total_loss > max_loss:
+            max_loss = total_loss
+            min_acc = correct
+
+    return max_loss, min_acc
+
+
+def layer_sharpness(args, model, epsilon=0.1):
+    model = _build_eval_model(args, model)
     criterion = nn.CrossEntropyLoss()
-
     trainloader = torch.utils.data.DataLoader(generate_adv_dataset(args, deepcopy(model)), batch_size=512, shuffle=True, num_workers=0)
+
     origin_total = 0
     origin_loss = 0.0
     origin_acc = 0
     with torch.no_grad():
         model.eval()
-        
-
         for inputs, targets in trainloader:
             outputs = model(inputs)
             origin_total += targets.shape[0]
             origin_loss += criterion(outputs, targets).item() * targets.shape[0]
             _, predicted = outputs.max(1)
-            origin_acc += predicted.eq(targets).sum().item()        
-        
+            origin_acc += predicted.eq(targets).sum().item()
+
         origin_acc /= origin_total
         origin_loss /= origin_total
 
-    args.logger.info("{:35}, Robust Loss: {:10.2f}, Robust Acc: {:10.2f}".format("Origin", origin_loss, origin_acc*100))
+    args.logger.info("{:35}, Robust Loss: {:10.2f}, Robust Acc: {:10.2f}".format("Origin", origin_loss, origin_acc * 100))
 
-    model.eval()
-    layer_sharpness_dict = {} 
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-            # print(name)
-            # For WideResNet
-            if "sub" in name:
+    layer_sharpness_dict = {}
+    target_layers = _collect_target_layers(model)
+
+    if args.layer is None:
+        for layer_name in target_layers:
+            result = _evaluate_mrc_group(args, model, trainloader, criterion, [layer_name], epsilon=epsilon)
+            if result is None:
                 continue
-            layer_sharpness_dict[name] = 1e10
+            max_loss, min_acc = result
+            layer_sharpness_dict[layer_name] = max_loss - origin_loss
+            args.logger.info("{:35}, MRC: {:10.2f}, Dropped Robust Acc: {:10.2f}".format(layer_name, max_loss - origin_loss, (origin_acc - min_acc) * 100))
 
-    for layer_name, _ in model.named_parameters():
-        if "weight" in layer_name and layer_name[:-len(".weight")] in layer_sharpness_dict.keys():
-            # print(layer_name)
-            cloned_model = deepcopy(model)
-            # set requires_grad sign for each layer
-            for name, param in cloned_model.named_parameters():
-                # print(name)
-                if name == layer_name:
-                    # print(name)
-                    param.requires_grad = True
-                    init_param = param.detach().clone()
-                else:
-                    param.requires_grad = False
-        
-            optimizer = torch.optim.SGD(cloned_model.parameters(), lr=1)
+        sorted_layer_sharpness = sorted(layer_sharpness_dict.items(), key=lambda x: x[1])
+        for (k, v) in sorted_layer_sharpness:
+            args.logger.info("{:35}, Robust Loss: {:10.2f}".format(k, v))
+        return sorted_layer_sharpness
 
-            max_loss = 0.0
-            min_acc = 0
-    
-            for epoch in range(10):
-                # Gradient ascent
-                for inputs, targets in trainloader:
-                    optimizer.zero_grad()
-                    outputs = cloned_model(inputs)
-                    loss = -1 * criterion(outputs, targets) 
-                    loss.backward()
-                    optimizer.step()
-                sd = cloned_model.state_dict()
-                diff = sd[layer_name] - init_param
-                times = torch.linalg.norm(diff)/torch.linalg.norm(init_param)
-                # print(times)
-                if times > epsilon:
-                    diff = diff / times * epsilon
-                    sd[layer_name] = deepcopy(init_param + diff)
-                    cloned_model.load_state_dict(sd)
+    normalized_target_layers = {_normalize_layer_name(layer) for layer in target_layers}
+    normalized_specified_layer = _normalize_layer_name(args.layer)
 
-                with torch.no_grad():
-                    total = 0
-                    total_loss = 0.0
-                    correct = 0
-                    for inputs, targets in trainloader:
-                        outputs = cloned_model(inputs)
-                        total += targets.shape[0]
-                        total_loss += criterion(outputs, targets).item() * targets.shape[0]
-                        _, predicted = outputs.max(1)
-                        correct += predicted.eq(targets).sum().item()  
-                    
-                    total_loss /= total
-                    correct /= total
+    if normalized_specified_layer not in normalized_target_layers:
+        raise ValueError(f"Specified layer '{args.layer}' was not found among eligible Conv2d/Linear layers.")
 
-                if total_loss > max_loss:
-                    max_loss = total_loss
-                    min_acc = correct
-            
-            layer_sharpness_dict[layer_name[:-len(".weight")]] = max_loss - origin_loss
-            args.logger.info("{:35}, MRC: {:10.2f}, Dropped Robust Acc: {:10.2f}".format(layer_name[:-len(".weight")], max_loss-origin_loss, (origin_acc-min_acc)*100))
+    for other_layer in target_layers:
+        if _normalize_layer_name(other_layer) == normalized_specified_layer:
+            continue
+        result = _evaluate_mrc_group(args, model, trainloader, criterion, [args.layer, other_layer], epsilon=epsilon)
+        if result is None:
+            continue
+        max_loss, min_acc = result
+        group_name = f"{args.layer} + {other_layer}"
+        layer_sharpness_dict[group_name] = max_loss - origin_loss
+        args.logger.info("{:35}, MRC: {:10.2f}, Dropped Robust Acc: {:10.2f}".format(group_name, max_loss - origin_loss, (origin_acc - min_acc) * 100))
 
-    sorted_layer_sharpness = sorted(layer_sharpness_dict.items(), key=lambda x:x[1])
+    sorted_layer_sharpness = sorted(layer_sharpness_dict.items(), key=lambda x: x[1])
     for (k, v) in sorted_layer_sharpness:
         args.logger.info("{:35}, Robust Loss: {:10.2f}".format(k, v))
-    
+
     return sorted_layer_sharpness
 
 
@@ -279,16 +337,17 @@ def main():
         evalulate_robustness = evaluate_tiny_robustness
 
 
-    if args.cal_mrc:    
+    if args.cal_mrc:
         layer_sharpness(args, deepcopy(model), epsilon=0.1)
         exit()
 
-    assert args.layer is not None
+    if not args.cal_mrc:
+        assert args.layer is not None
 
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if args.layer in name:
-            param.requires_grad = True
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+            if args.layer in name:
+                param.requires_grad = True
 
     _, train_acc = evaluate(args, model, trainloader, criterion)
     _, test_acc = evaluate(args, model, testloader, criterion)
