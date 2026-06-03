@@ -28,7 +28,6 @@ def _build_transforms(dataset):
         ])
         transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
         ])
     else:
         transform_train = transforms.Compose([
@@ -38,7 +37,6 @@ def _build_transforms(dataset):
         ])
         transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
     return {"train": transform_train, "test": transform_test}
 
@@ -79,6 +77,36 @@ def _build_norm_model(args, model):
     else:
         norm_layer = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     return nn.Sequential(norm_layer, model).to(args.device)
+
+
+def _evaluate_robust(args, model):
+    model.eval()
+    if "CIFAR" in args.dataset:
+        transform_test = transforms.Compose([transforms.ToTensor()])
+        if args.dataset == "CIFAR10":
+            dataset = datasets.CIFAR10(root=os.path.join(args.data_root, "CIFAR-10"), train=False, download=True, transform=transform_test)
+        else:
+            dataset = datasets.CIFAR100(root=os.path.join(args.data_root, "CIFAR-100"), train=False, download=True, transform=transform_test)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
+        atk_model = torchattacks.PGD(model, eps=8 / 255, alpha=2 / 225, steps=10, random_start=True)
+    else:
+        transform_test = transforms.Compose([transforms.ToTensor()])
+        from dataloader import TinyImageNet
+        dataset = TinyImageNet("val", transform_test, data_root=args.data_root)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
+        atk_model = torchattacks.PGD(model, eps=8 / 255, alpha=2 / 225, steps=10, random_start=True)
+
+    total = 0
+    correct = 0
+    for images, labels in dataloader:
+        images = images.to(args.device)
+        labels = labels.to(args.device)
+        adv_images = atk_model(images, labels)
+        outputs = model(adv_images)
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+    return correct / total * 100
 
 
 def _create_adv_trainloader(args):
@@ -148,11 +176,11 @@ def _train_one_layer_adv(args, model, trainloader, testloader, criterion, optimi
         scheduler.step()
 
         clean_loss, clean_acc = _evaluate_clean(args, model, testloader, criterion)
-        robust_acc = eval_robustness_func(args, model)
+        robust_acc = _evaluate_robust(args, model)
         train_acc = 100.0 * train_correct / train_total
         train_loss /= train_total
         args.logger.info(
-            "layer=%s epoch=%d train_loss=%.4f train_acc=%.2f%% clean_loss=%.4f clean_acc=%.2f%% robust_acc=%.2f%%",
+            "layer=%s epoch=%d adv_train_loss=%.4f train_acc=%.2f%% clean_loss=%.4f clean_acc=%.2f%% robust_acc=%.2f%%",
             args.layer,
             epoch,
             train_loss,
@@ -216,13 +244,17 @@ def main():
     )
 
     model = create_model(args.model, args.input_size, args.num_classes, args.device, args.patch, args.resume)
+    model = _build_norm_model(args, model)
     criterion = nn.CrossEntropyLoss()
 
     target_layers = _collect_layers(model)
-    if args.layer not in target_layers:
+    normalized_target_layers = {_normalize_layer_name(layer) for layer in target_layers}
+    normalized_requested_layer = _normalize_layer_name(args.layer)
+    if normalized_requested_layer not in normalized_target_layers:
         raise ValueError(f"layer '{args.layer}' not found in model")
 
-    _set_trainable_layers(model, args.layer)
+    canonical_layer = next(layer for layer in target_layers if _normalize_layer_name(layer) == normalized_requested_layer)
+    _set_trainable_layers(model, canonical_layer)
     optimizer = create_optimizer(args.optim, model, args.lr, args.momentum, weight_decay=args.wd)
     scheduler = create_scheduler(args, optimizer)
 
@@ -232,7 +264,7 @@ def main():
         eval_robustness_func = evaluate_tiny_robustness
 
     _, init_clean_acc = _evaluate_clean(args, model, testloader, criterion)
-    init_robust_acc = eval_robustness_func(args, model)
+    init_robust_acc = _evaluate_robust(args, model)
     logger.info("Init clean acc=%.2f%%, robust acc=%.2f%%", init_clean_acc, init_robust_acc)
 
     init_sd = deepcopy(model.state_dict())
@@ -244,7 +276,7 @@ def main():
         criterion,
         optimizer,
         scheduler,
-        eval_robustness_func,
+        _evaluate_robust,
     )
 
     torch.save(
@@ -258,7 +290,7 @@ def main():
     )
 
     final_clean_loss, final_clean_acc = _evaluate_clean(args, model, testloader, criterion)
-    final_robust_acc = eval_robustness_func(args, model)
+    final_robust_acc = _evaluate_robust(args, model)
     logger.info("Final clean loss=%.4f clean acc=%.2f%% robust acc=%.2f%%", final_clean_loss, final_clean_acc, final_robust_acc)
     logger.info("Best clean acc during adv finetune: %.2f%%", best_clean_acc)
 
