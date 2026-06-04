@@ -149,27 +149,204 @@ def layer_sharpness(args, model, epsilon=0.1):
     return sorted_layer_sharpness
 
 
-def train(args, model, dataloader, optimizer, criterion):
+def _unwrap_state_dict(checkpoint):
+    if "net" in checkpoint:
+        return checkpoint["net"]
+    if "state_dict" in checkpoint:
+        return checkpoint["state_dict"]
+    if "model" in checkpoint:
+        return checkpoint["model"]
+    return checkpoint
+
+
+def _strip_module_prefix(state_dict):
+    stripped = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            stripped[k[len("module."):]] = v
+        else:
+            stripped[k] = v
+    return stripped
+
+
+def _add_module_prefix(state_dict):
+    prefixed = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            prefixed[k] = v
+        else:
+            prefixed[f"module.{k}"] = v
+    return prefixed
+
+
+def _load_weights_into_model(model, path, device, strict=True):
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = _strip_module_prefix(_unwrap_state_dict(checkpoint))
+
+    # Make checkpoint/model naming consistent for DataParallel vs non-DataParallel models.
+    model_state_keys = next(iter(model.state_dict().keys()))
+    model_expects_module_prefix = model_state_keys.startswith("module.")
+    checkpoint_has_module_prefix = next(iter(state_dict.keys())).startswith("module.") if len(state_dict) > 0 else False
+
+    if model_expects_module_prefix and not checkpoint_has_module_prefix:
+        state_dict = _add_module_prefix(state_dict)
+    elif not model_expects_module_prefix and checkpoint_has_module_prefix:
+        state_dict = _strip_module_prefix(state_dict)
+
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    return model, incompatible.missing_keys, incompatible.unexpected_keys
+
+
+def _get_base_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _get_target_param_names(model, layer_prefix):
+    base_model = _get_base_model(model)
+    return [name for name, _ in base_model.named_parameters() if name.startswith(layer_prefix)]
+
+
+def _build_teacher_target_map(model, teacher_model, target_param_names):
+    student_base = _get_base_model(model)
+    teacher_base = _get_base_model(teacher_model)
+
+    student_params = dict(student_base.named_parameters())
+    teacher_params = dict(teacher_base.named_parameters())
+
+    target_map = {}
+    for name in target_param_names:
+        if name not in student_params:
+            raise KeyError(f"Student model is missing parameter: {name}")
+        if name not in teacher_params:
+            raise KeyError(f"Teacher model is missing parameter: {name}")
+        if student_params[name].shape != teacher_params[name].shape:
+            raise ValueError(
+                f"Shape mismatch for parameter {name}: "
+                f"student={tuple(student_params[name].shape)}, teacher={tuple(teacher_params[name].shape)}"
+            )
+        target_map[name] = teacher_params[name].detach().clone()
+    return target_map
+
+
+def _resolve_module_by_prefix(model, layer_prefix):
+    base_model = _get_base_model(model)
+    modules = dict(base_model.named_modules())
+    candidates = [layer_prefix]
+    if layer_prefix.endswith(".weight") or layer_prefix.endswith(".bias"):
+        candidates.append(layer_prefix.rsplit(".", 1)[0])
+
+    for candidate in candidates:
+        if candidate in modules:
+            return candidate, modules[candidate]
+
+    available = [name for name in modules.keys() if name.startswith(layer_prefix)]
+    if available:
+        available.sort(key=len)
+        return available[0], modules[available[0]]
+
+    raise KeyError(f"Cannot resolve module for layer prefix: {layer_prefix}")
+
+
+def _relative_weight_penalty(student_model, teacher_target_map, eps=1e-12):
+    student_base = _get_base_model(student_model)
+    student_params = dict(student_base.named_parameters())
+
+    penalty = torch.tensor(0.0, device=next(student_base.parameters()).device)
+    for name, teacher_param in teacher_target_map.items():
+        student_param = student_params[name]
+        diff_sq = torch.sum((student_param - teacher_param) ** 2)
+        denom = torch.sum(teacher_param.detach() ** 2) + eps
+        penalty = penalty + diff_sq / denom
+    return penalty
+
+
+def _feature_penalty(student_feature, teacher_feature, eps=1e-12):
+    diff_sq = torch.sum((student_feature - teacher_feature) ** 2)
+    denom = torch.sum(teacher_feature.detach() ** 2) + eps
+    return diff_sq / denom
+
+
+def _get_module_output_cache(module):
+    cache = {"output": None}
+
+    def hook(_module, _inputs, output):
+        cache["output"] = output
+
+    handle = module.register_forward_hook(hook)
+    return cache, handle
+
+
+def train(args, model, teacher_model, teacher_target_map, dataloader, optimizer, criterion, teacher_weight_lambda, teacher_feature_lambda, student_feature_module=None, teacher_feature_module=None):
     model.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     train_loss = 0
+    ce_loss_sum = 0
+    reg_weight_sum = 0
+    reg_feature_sum = 0
     correct = 0
     total = 0
 
-    for i, (inputs, targets) in enumerate(tqdm(dataloader)):
-        inputs, targets = inputs.to(args.device), targets.to(args.device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        train_loss += loss.item() * targets.size(0)
+    student_cache, student_handle = (None, None)
+    teacher_cache, teacher_handle = (None, None)
+    if student_feature_module is not None and teacher_feature_module is not None and teacher_feature_lambda > 0:
+        student_cache, student_handle = _get_module_output_cache(student_feature_module)
+        teacher_cache, teacher_handle = _get_module_output_cache(teacher_feature_module)
 
-        loss.backward()
-        optimizer.step()
-        
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+    try:
+        for i, (inputs, targets) in enumerate(tqdm(dataloader)):
+            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            optimizer.zero_grad()
 
-    return train_loss / total, correct / total * 100
+            if student_handle is not None and teacher_handle is not None:
+                teacher_cache["output"] = None
+                student_cache["output"] = None
+                with torch.no_grad():
+                    _ = teacher_model(inputs)
+                outputs = model(inputs)
+            else:
+                outputs = model(inputs)
+
+            ce_loss = criterion(outputs, targets)
+
+            weight_reg = torch.tensor(0.0, device=inputs.device)
+            feature_reg = torch.tensor(0.0, device=inputs.device)
+            if teacher_target_map is not None and teacher_weight_lambda > 0:
+                weight_reg = _relative_weight_penalty(model, teacher_target_map)
+            if (
+                teacher_feature_lambda > 0
+                and student_cache is not None
+                and teacher_cache is not None
+                and student_cache["output"] is not None
+                and teacher_cache["output"] is not None
+            ):
+                student_feat = student_cache["output"]
+                teacher_feat = teacher_cache["output"].detach()
+                if isinstance(student_feat, (tuple, list)):
+                    student_feat = student_feat[0]
+                if isinstance(teacher_feat, (tuple, list)):
+                    teacher_feat = teacher_feat[0]
+                feature_reg = _feature_penalty(student_feat, teacher_feat)
+
+            loss = ce_loss + teacher_weight_lambda * weight_reg + teacher_feature_lambda * feature_reg
+            train_loss += loss.item() * targets.size(0)
+            ce_loss_sum += ce_loss.item() * targets.size(0)
+            reg_weight_sum += weight_reg.item() * targets.size(0)
+            reg_feature_sum += feature_reg.item() * targets.size(0)
+
+            loss.backward()
+            optimizer.step()
+            
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+    finally:
+        if student_handle is not None:
+            student_handle.remove()
+        if teacher_handle is not None:
+            teacher_handle.remove()
+
+    return train_loss / total, ce_loss_sum / total, reg_weight_sum / total, reg_feature_sum / total, correct / total * 100
 
 
 def main():
@@ -180,6 +357,13 @@ def main():
     parser.add_argument('--num_classes', default=10, type=int, help='num classes')
     parser.add_argument('--input_size', default=32, type=int, help='input_size')
     parser.add_argument('--layer', default=None, type=str, help='Trainable layer')
+    parser.add_argument('--teacher', default=None, type=str, help='teacher checkpoint for layer guidance')
+    parser.add_argument('--teacher_weight_lambda', default=1.0, type=float, help='weight of teacher relative weight regularization')
+    parser.add_argument('--teacher_feature_lambda', default=1.0, type=float, help='weight of teacher feature regularization')
+    parser.add_argument('--teacher_init_weight_lambda', default=0.0, type=float, help='initial teacher weight regularization')
+    parser.add_argument('--teacher_init_feature_lambda', default=0.0, type=float, help='initial teacher feature regularization')
+    parser.add_argument('--teacher_warmup_epochs', default=2, type=int, help='epochs to warm up teacher regularization')
+    parser.add_argument('--teacher_feature_layer', default=None, type=str, help='module prefix for feature guidance; defaults to target layer prefix')
     parser.add_argument("--cal_mrc", action="store_true", help='If to calculate Module Robust Criticality (MRC) value of each module.')
     
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
@@ -261,6 +445,19 @@ def main():
     model = create_model(args.model, args.input_size, args.num_classes, args.device, args.patch, args.resume)
     logger.info(args.model)
 
+    teacher_model = None
+    teacher_target_map = None
+    if args.teacher is not None:
+        logger.info(f"==> Loading teacher model from {args.teacher}")
+        teacher_model = create_model(args.model, args.input_size, args.num_classes, args.device, args.patch, None)
+        teacher_model, missing_keys, unexpected_keys = _load_weights_into_model(teacher_model, args.teacher, args.device)
+        teacher_model = teacher_model.to(args.device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        if missing_keys or unexpected_keys:
+            raise ValueError(f"Teacher checkpoint mismatch. missing={missing_keys}, unexpected={unexpected_keys}")
+
     logger.info('==> Building optimizer and learning rate scheduler...')
     optimizer = create_optimizer(args.optim, model, args.lr, args.momentum, weight_decay=args.wd)
     logger.info(optimizer)
@@ -285,10 +482,25 @@ def main():
 
     assert args.layer is not None
 
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if args.layer in name:
-            param.requires_grad = True
+    target_param_names = _get_target_param_names(model, args.layer)
+    if len(target_param_names) == 0:
+        raise ValueError(f"No parameters matched layer prefix: {args.layer}")
+    logger.info(f"==> Trainable parameters: {target_param_names}")
+
+    base_model = _get_base_model(model)
+    for name, param in base_model.named_parameters():
+        param.requires_grad = name in target_param_names
+
+    student_feature_module = None
+    teacher_feature_module = None
+    if teacher_model is not None:
+        teacher_target_map = _build_teacher_target_map(model, teacher_model, target_param_names)
+        logger.info(f"==> Teacher guidance enabled for {len(teacher_target_map)} parameters")
+
+        feature_layer_name = args.teacher_feature_layer or args.layer
+        student_feature_layer_name, student_feature_module = _resolve_module_by_prefix(model, feature_layer_name)
+        teacher_feature_layer_name, teacher_feature_module = _resolve_module_by_prefix(teacher_model, feature_layer_name)
+        logger.info(f"==> Feature guidance layer: student={student_feature_layer_name}, teacher={teacher_feature_layer_name}")
 
     _, train_acc = evaluate(args, model, trainloader, criterion)
     _, test_acc = evaluate(args, model, testloader, criterion)
@@ -300,9 +512,27 @@ def main():
 
         logger.info("==> Epoch {}".format(epoch))
         logger.info("==> Training...")
-        train_loss, train_acc = train(args, model, trainloader, optimizer, criterion)
+        if args.teacher_warmup_epochs > 0:
+            weight_lambda = args.teacher_init_weight_lambda + (args.teacher_weight_lambda - args.teacher_init_weight_lambda) * min((epoch + 1) / args.teacher_warmup_epochs, 1.0)
+            feature_lambda = args.teacher_init_feature_lambda + (args.teacher_feature_lambda - args.teacher_init_feature_lambda) * min((epoch + 1) / args.teacher_warmup_epochs, 1.0)
+        else:
+            weight_lambda = args.teacher_weight_lambda
+            feature_lambda = args.teacher_feature_lambda
+        train_loss, ce_loss, reg_weight, reg_feature, train_acc = train(
+            args,
+            model,
+            teacher_model,
+            teacher_target_map,
+            trainloader,
+            optimizer,
+            criterion,
+            weight_lambda,
+            feature_lambda,
+            student_feature_module,
+            teacher_feature_module,
+        )
 
-        logger.info("==> Train loss: {:.2f}, train acc: {:.2f}%".format(train_loss, train_acc))
+        logger.info("==> Train loss: {:.6f}, ce loss: {:.6f}, reg weight: {:.6f}, reg feature: {:.6f}, train acc: {:.2f}%".format(train_loss, ce_loss, reg_weight, reg_feature, train_acc))
 
         logger.info("==> Testing...")
         test_loss, test_acc = evaluate(args, model, testloader, criterion)
