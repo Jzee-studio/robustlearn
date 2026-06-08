@@ -11,6 +11,7 @@ import sys
 import time
 import logging
 import shutil
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -21,13 +22,38 @@ import numpy as np
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import torchattacks
+import wandb
+from torch.utils.tensorboard import SummaryWriter
 from dataloader import CIFAR10C, CIFAR100C, TinyImageNetC
+
+
+def setup_wandb(args):
+    run_name = args.wandb_name or f"{args.model}_{args.dataset}_{args.method}"
+    run = wandb.init(
+        project=args.wandb_project,
+        name=run_name,
+        config=vars(args),
+        mode=args.wandb_mode,
+        reinit=True,
+    )
+    return run
+
+
+def wandb_log(metrics, step=None):
+    wandb.log(metrics, step=step)
+
+
+def setup_tensorboard(log_dir):
+    return SummaryWriter(log_dir=log_dir)
+
+
+def tb_log(writer, metrics, step):
+    for k, v in metrics.items():
+        writer.add_scalar(k, v, step)
 
 
 def interpolation(args, logger, init_sd, ft_sd, model, dataloader, criterion, save_dir, eval_robustness_func):
     alphas = np.arange(0, 1.1, 0.1)
-
-    # alphas = np.arange(0, 0.21, 0.01)
 
     records = []
 
@@ -232,7 +258,7 @@ def evaluate_cifar_corruption(args, model, data_dir="./data/CIFAR-100-C"):
 
 def evaluate(args, model, dataloader, criterion):
     model.eval()
-    loss = 0
+    total_loss = 0.0
     correct = 0
     total = 0
     with torch.no_grad():
@@ -241,13 +267,19 @@ def evaluate(args, model, dataloader, criterion):
             outputs = model(inputs)
             loss = criterion(outputs, targets)
 
-            loss += loss.item()
+            total_loss += loss.item() * targets.size(0)
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
     acc = 100. * correct / total
-    return loss, acc
+    return total_loss / total, acc
+
+
+def evaluate_accuracy_from_logits(logits, targets):
+    _, predicted = logits.max(1)
+    correct = predicted.eq(targets).sum().item()
+    return correct / targets.size(0) * 100.0
 
 
 class Normalize(nn.Module):
@@ -269,17 +301,16 @@ def create_logger(log_path):
     """
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
+    logger.handlers.clear()
 
     formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s')
 
-    # 创建一个handler，用于写入日志文件
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.INFO)
     logger.addHandler(file_handler)
 
-    # 创建一个handler，用于将日志输出到控制台
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(formatter)
@@ -359,7 +390,6 @@ def progress_bar(current, total, msg=None):
     for i in range(term_width-int(TOTAL_BAR_LENGTH)-len(msg)-3):
         sys.stdout.write(' ')
 
-    # Go back to the center of the bar.
     for i in range(term_width-int(TOTAL_BAR_LENGTH/2)+2):
         sys.stdout.write('\b')
     sys.stdout.write(' %d/%d ' % (current+1, total))
@@ -404,15 +434,15 @@ def format_time(seconds):
 
 
 def get_all_trained_model_params(path):
-
 	trained_params_list = []
 
 	for (root, dirs, files) in os.walk(path):
-		# print(root, dirs, files)
 		if len(files) > 0:
 			for my_file in files:
 				if my_file.find(".pth") != -1:
 					trained_params_list.append(root+"/"+my_file)
-	# print(trained_params_list)
-	# exit()
 	return trained_params_list
+
+
+def format_eta(seconds):
+    return format_time(max(0, int(seconds)))
