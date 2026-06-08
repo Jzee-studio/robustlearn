@@ -81,13 +81,26 @@ def create_model(model_name, input_size, num_classes, device, patch_size=4, resu
 		# print(checkpoint.items())
 		# exit()
 		if "net" in checkpoint.keys():
-			model.load_state_dict(checkpoint["net"])
+			sd = checkpoint["net"]
 		elif "state_dict" in checkpoint.keys():
-			model.load_state_dict(checkpoint["state_dict"])
+			sd = checkpoint["state_dict"]
 		elif "model" in checkpoint.keys():
-			model.load_state_dict(checkpoint["model"])
+			sd = checkpoint["model"]
 		else:
-			model.load_state_dict(checkpoint)
+			sd = checkpoint
+
+		try:
+			model.load_state_dict(sd)
+		except RuntimeError:
+			if isinstance(model, torch.nn.DataParallel):
+				try:
+					model.module.load_state_dict(sd)
+				except RuntimeError:
+					sd = {f"module.{k}": v for k, v in sd.items()}
+					model.load_state_dict(sd)
+			else:
+				sd = {k.replace("module.", ""): v for k, v in sd.items()}
+				model.load_state_dict(sd)
 
 	return model
 

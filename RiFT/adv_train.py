@@ -99,6 +99,27 @@ def make_model_for_eval(model):
     return model
 
 
+def load_state_dict_flexible(model, state_dict):
+    try:
+        model.load_state_dict(state_dict)
+        return
+    except RuntimeError:
+        pass
+
+    if isinstance(model, torch.nn.DataParallel):
+        try:
+            model.module.load_state_dict(state_dict)
+            return
+        except RuntimeError:
+            pass
+        prefixed = {f"module.{k}": v for k, v in state_dict.items()}
+        model.load_state_dict(prefixed)
+        return
+
+    stripped = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(stripped)
+
+
 def evaluate_robust(args, model):
     eval_model = make_model_for_eval(model)
     if "CIFAR" in args.dataset:
@@ -269,11 +290,11 @@ def main():
         checkpoint = torch.load(args.resume, map_location=args.device)
         if isinstance(checkpoint, dict):
             if "model" in checkpoint:
-                model.load_state_dict(checkpoint["model"])
+                load_state_dict_flexible(model, checkpoint["model"])
             elif "state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["state_dict"])
+                load_state_dict_flexible(model, checkpoint["state_dict"])
             elif "net" in checkpoint:
-                model.load_state_dict(checkpoint["net"])
+                load_state_dict_flexible(model, checkpoint["net"])
             if "optimizer" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if "scheduler" in checkpoint:
@@ -365,7 +386,7 @@ def main():
 
     logger.info("==> Loading best checkpoint for final report...")
     best_ckpt = torch.load(os.path.join(model_save_dir, "best_params.pth"), map_location=args.device)
-    model.load_state_dict(best_ckpt["model"])
+    load_state_dict_flexible(model, best_ckpt["model"])
 
     final_test_loss, final_test_acc = evaluate(args, model, testloader, criterion)
     final_robust_acc = eval_robustness(args, make_model_for_eval(model))
