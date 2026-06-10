@@ -1,12 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import argparse
+
 from torch.utils.data.sampler import SubsetRandomSampler
 from copy import deepcopy
 from tqdm import tqdm
 
 from utils import *
 from dataloader import *
+from dataloader import build_train_transform
 from model import create_model
 from optimizer import *
 
@@ -364,6 +367,10 @@ def main():
     parser.add_argument('--teacher_init_feature_lambda', default=0.0, type=float, help='initial teacher feature regularization')
     parser.add_argument('--teacher_warmup_epochs', default=2, type=int, help='epochs to warm up teacher regularization')
     parser.add_argument('--teacher_feature_layer', default=None, type=str, help='module prefix for feature guidance; defaults to target layer prefix')
+    parser.add_argument('--use_augmix', action='store_true', help='use AugMix augmentation during finetuning')
+    parser.add_argument('--augmix_width', default=3, type=int, help='AugMix mixture width')
+    parser.add_argument('--augmix_depth', default=-1, type=int, help='AugMix chain depth; -1 samples randomly')
+    parser.add_argument('--augmix_severity', default=3, type=int, help='AugMix severity')
     parser.add_argument("--cal_mrc", action="store_true", help='If to calculate Module Robust Criticality (MRC) value of each module.')
     
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
@@ -408,26 +415,20 @@ def main():
 
     # create dataloader
     logger.info('==> Preparing data and create dataloaders...')
-    if "CIFAR" in args.dataset:
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
-        ])
+    transform_train = build_train_transform(
+        args.dataset,
+        use_augmix=args.use_augmix,
+        augmix_width=args.augmix_width,
+        augmix_depth=args.augmix_depth,
+        augmix_severity=args.augmix_severity,
+    )
 
+    if "CIFAR" in args.dataset:
         transform_test = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2471, 0.2435, 0.2616)),
         ])
     else:
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(64, padding=8, padding_mode="reflect"),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        ])
-
         transform_test = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
